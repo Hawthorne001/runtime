@@ -45,6 +45,27 @@ bool Compiler::fgHaveProfileWeights()
 }
 
 //------------------------------------------------------------------------
+// fgRemoveProfileData: Remove all traces of profile info
+//
+// Notes:
+//   Needed if the jit initially thought it was going to optimize
+//   the method, but then decided not to.
+//
+//   Does not modify any block fields, so should be called before
+//   we start to incorporate profile data.
+//
+void Compiler::fgRemoveProfileData(const char* reason)
+{
+    fgPgoFailReason  = reason;
+    fgPgoQueryResult = E_FAIL;
+    fgPgoHaveWeights = false;
+    fgPgoData        = nullptr;
+    fgPgoSchema      = nullptr;
+    fgPgoDisabled    = true;
+    fgPgoDynamic     = false;
+}
+
+//------------------------------------------------------------------------
 // fgHaveSufficientProfileWeights: check if profile data is available
 //   and is sufficient enough to be trustful.
 //
@@ -141,22 +162,39 @@ void Compiler::fgApplyProfileScale()
         JITDUMP("   ... no callee profile data, will use non-pgo weight to scale\n");
     }
 
-    // Ostensibly this should be fgCalledCount for the callee, but that's not available
-    // as it requires some analysis.
+    // Determine the weight of the first block preds, if any.
+    // (only happens if the first block is a loop head).
     //
-    // For most callees it will be the same as the entry block count.
-    //
-    // Note when/if we early do normalization this may need to change.
+    weight_t firstBlockPredWeight = 0;
+    for (FlowEdge* const firstBlockPred : fgFirstBB->PredEdges())
+    {
+        firstBlockPredWeight += firstBlockPred->getLikelyWeight();
+    }
+
+    // Determine the "input" weight for the callee
     //
     weight_t calleeWeight = fgFirstBB->bbWeight;
 
-    // Callee entry weight is nonzero?
+    // Callee entry weight is zero or negative (taking backedges into account)?
     // If so, just choose the smallest plausible weight.
     //
-    if (calleeWeight == BB_ZERO_WEIGHT)
+    if (calleeWeight <= firstBlockPredWeight)
     {
         calleeWeight = fgHaveProfileWeights() ? 1.0 : BB_UNITY_WEIGHT;
-        JITDUMP("   ... callee entry has weight zero, will use weight of " FMT_WT " to scale\n", calleeWeight);
+        JITDUMP("   ... callee entry has zero or negative weight, will use weight of " FMT_WT " to scale\n",
+                calleeWeight);
+        JITDUMP("Profile data could not be scaled consistently. Data %s inconsistent.\n",
+                fgPgoConsistent ? "is now" : "was already");
+
+        if (fgPgoConsistent)
+        {
+            Metrics.ProfileInconsistentInlineeScale++;
+            fgPgoConsistent = false;
+        }
+    }
+    else
+    {
+        calleeWeight -= firstBlockPredWeight;
     }
 
     // Call site has profile weight?
@@ -327,9 +365,6 @@ public:
     virtual void Instrument(BasicBlock* block, Schema& schema, uint8_t* profileMemory)
     {
     }
-    virtual void InstrumentMethodEntry(Schema& schema, uint8_t* profileMemory)
-    {
-    }
     unsigned SchemaCount() const
     {
         return m_schemaCount;
@@ -385,7 +420,6 @@ public:
     void Prepare(bool isPreImport) override;
     void BuildSchemaElements(BasicBlock* block, Schema& schema) override;
     void Instrument(BasicBlock* block, Schema& schema, uint8_t* profileMemory) override;
-    void InstrumentMethodEntry(Schema& schema, uint8_t* profileMemory) override;
 
     static GenTree* CreateCounterIncrement(Compiler* comp, uint8_t* counterAddr, var_types countType);
 };
@@ -653,89 +687,6 @@ void BlockCountInstrumentor::Instrument(BasicBlock* block, Schema& schema, uint8
     }
 
     m_instrCount++;
-}
-
-//------------------------------------------------------------------------
-// BlockCountInstrumentor::InstrumentMethodEntry: add any special method entry instrumentation
-//
-// Arguments:
-//   schema -- instrumentation schema
-//   profileMemory -- profile data slab
-//
-// Notes:
-//   When prejitting, add the method entry callback node
-//
-void BlockCountInstrumentor::InstrumentMethodEntry(Schema& schema, uint8_t* profileMemory)
-{
-    Compiler::Options& opts = m_comp->opts;
-    Compiler::Info&    info = m_comp->info;
-
-    // Nothing to do, if not prejitting.
-    //
-    if (!opts.jitFlags->IsSet(JitFlags::JIT_FLAG_PREJIT))
-    {
-        return;
-    }
-
-    // Find the address of the entry block's counter.
-    //
-    assert(m_entryBlock != nullptr);
-    assert(m_entryBlock->bbCodeOffs == 0);
-
-    const ICorJitInfo::PgoInstrumentationSchema& entry = schema[m_entryBlock->bbCountSchemaIndex];
-    assert((IL_OFFSET)entry.ILOffset == 0);
-    assert((entry.InstrumentationKind == ICorJitInfo::PgoInstrumentationKind::BasicBlockIntCount) ||
-           (entry.InstrumentationKind == ICorJitInfo::PgoInstrumentationKind::BasicBlockLongCount));
-
-    const size_t addrOfFirstExecutionCount = (size_t)(entry.Offset + profileMemory);
-
-    GenTree* arg;
-
-#ifdef FEATURE_READYTORUN
-    if (opts.IsReadyToRun())
-    {
-        mdMethodDef currentMethodToken = info.compCompHnd->getMethodDefFromMethod(info.compMethodHnd);
-
-        CORINFO_RESOLVED_TOKEN resolvedToken;
-        resolvedToken.tokenContext = MAKE_METHODCONTEXT(info.compMethodHnd);
-        resolvedToken.tokenScope   = info.compScopeHnd;
-        resolvedToken.token        = currentMethodToken;
-        resolvedToken.tokenType    = CORINFO_TOKENKIND_Method;
-
-        info.compCompHnd->resolveToken(&resolvedToken);
-
-        arg = m_comp->impTokenToHandle(&resolvedToken);
-    }
-    else
-#endif
-    {
-        arg = m_comp->gtNewIconEmbMethHndNode(info.compMethodHnd);
-    }
-
-    // We want to call CORINFO_HELP_BBT_FCN_ENTER just one time,
-    // the first time this method is called. So make the call conditional
-    // on the entry block's profile count.
-    //
-    GenTreeCall* call = m_comp->gtNewHelperCallNode(CORINFO_HELP_BBT_FCN_ENTER, TYP_VOID, arg);
-
-    var_types typ =
-        entry.InstrumentationKind == ICorJitInfo::PgoInstrumentationKind::BasicBlockIntCount ? TYP_INT : TYP_LONG;
-    // Read Basic-Block count value
-    //
-    GenTree* valueNode = m_comp->gtNewIndOfIconHandleNode(typ, addrOfFirstExecutionCount, GTF_ICON_BBC_PTR, false);
-
-    // Compare Basic-Block count value against zero
-    //
-    GenTree*      relop = m_comp->gtNewOperNode(GT_NE, typ, valueNode, m_comp->gtNewIconNode(0, typ));
-    GenTreeColon* colon = new (m_comp, GT_COLON) GenTreeColon(TYP_VOID, m_comp->gtNewNothingNode(), call);
-    GenTreeQmark* cond  = m_comp->gtNewQmarkNode(TYP_VOID, relop, colon);
-    Statement*    stmt  = m_comp->gtNewStmt(cond);
-
-    // Add this check into the scratch block entry so we only do the check once per call.
-    // If we put it in block we may be putting it inside a loop.
-    //
-    m_comp->fgEnsureFirstBBisScratch();
-    m_comp->fgInsertStmtAtEnd(m_comp->fgFirstBB, stmt);
 }
 
 //------------------------------------------------------------------------
@@ -2810,13 +2761,6 @@ PhaseStatus Compiler::fgInstrumentMethod()
     //
     assert(fgHistogramInstrumentor->InstrCount() == info.compHandleHistogramProbeCount);
 
-    // Add any special entry instrumentation. This does not
-    // use the schema mechanism.
-    //
-    fgCountInstrumentor->InstrumentMethodEntry(schema, profileMemory);
-    fgHistogramInstrumentor->InstrumentMethodEntry(schema, profileMemory);
-    fgValueInstrumentor->InstrumentMethodEntry(schema, profileMemory);
-
     return PhaseStatus::MODIFIED_EVERYTHING;
 }
 
@@ -2835,8 +2779,8 @@ PhaseStatus Compiler::fgIncorporateProfileData()
     {
         JITDUMP("JitStress -- incorporating random profile data\n");
         fgIncorporateBlockCounts();
-        fgApplyProfileScale();
         ProfileSynthesis::Run(this, ProfileSynthesisOption::RepairLikelihoods);
+        fgApplyProfileScale();
         return PhaseStatus::MODIFIED_EVERYTHING;
     }
 
@@ -2857,6 +2801,7 @@ PhaseStatus Compiler::fgIncorporateProfileData()
         {
             JITDUMP("Synthesizing profile data\n");
             ProfileSynthesis::Run(this, ProfileSynthesisOption::AssignLikelihoods);
+            fgApplyProfileScale();
             return PhaseStatus::MODIFIED_EVERYTHING;
         }
     }
@@ -2868,6 +2813,7 @@ PhaseStatus Compiler::fgIncorporateProfileData()
     {
         JITDUMP("Synthesizing profile data and writing it out as the actual profile data\n");
         ProfileSynthesis::Run(this, ProfileSynthesisOption::AssignLikelihoods);
+        fgApplyProfileScale();
         return PhaseStatus::MODIFIED_EVERYTHING;
     }
 #endif
@@ -3543,15 +3489,6 @@ void EfficientEdgeCountReconstructor::Prepare()
 //
 void EfficientEdgeCountReconstructor::Solve()
 {
-    // If we have dynamic PGO data, we don't expect to see any mismatches,
-    // since the schema we got from the runtime should have come from the
-    // exact same JIT and IL, created in an earlier tier.
-    //
-    if (m_comp->fgPgoSource == ICorJitInfo::PgoSource::Dynamic)
-    {
-        assert(!m_mismatch);
-    }
-
     // If issues arose earlier, then don't try solving.
     //
     if (m_badcode || m_mismatch || m_allWeightsZero)

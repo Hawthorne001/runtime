@@ -59,8 +59,10 @@ CONFIG_INTEGER(JitBreakMorphTree, W("JitBreakMorphTree"), 0xffffffff)
 CONFIG_INTEGER(JitBreakOnBadCode, W("JitBreakOnBadCode"), 0)
 CONFIG_INTEGER(JitBreakOnMinOpts, W("JITBreakOnMinOpts"), 0) // Halt if jit switches to MinOpts
 CONFIG_INTEGER(JitCloneLoops, W("JitCloneLoops"), 1) // If 0, don't clone. Otherwise clone loops for optimizations.
-CONFIG_INTEGER(JitCloneLoopsWithGdvTests, W("JitCloneLoopsWithGdvTests"), 1) // If 0, don't clone loops based on
-                                                                             // invariant type/method address tests
+CONFIG_INTEGER(JitCloneLoopsWithGdvTests, W("JitCloneLoopsWithGdvTests"), 1)     // If 0, don't clone loops based on
+                                                                                 // invariant type/method address tests
+RELEASE_CONFIG_INTEGER(JitCloneLoopsSizeLimit, W("JitCloneLoopsSizeLimit"), 400) // limit cloning to loops with less
+                                                                                 // than this many tree nodes
 CONFIG_INTEGER(JitDebugLogLoopCloning, W("JitDebugLogLoopCloning"), 0) // In debug builds log places where loop cloning
                                                                        // optimizations are performed on the fast path.
 CONFIG_INTEGER(JitDefaultFill, W("JitDefaultFill"), 0xdd) // In debug builds, initialize the memory allocated by the nra
@@ -138,7 +140,6 @@ CONFIG_INTEGER(JitNoForceFallback, W("JitNoForceFallback"), 0) // Set to non-zer
                                                                // flags.
 CONFIG_INTEGER(JitNoForwardSub, W("JitNoForwardSub"), 0)       // Disables forward sub
 CONFIG_INTEGER(JitNoHoist, W("JitNoHoist"), 0)
-CONFIG_INTEGER(JitNoInline, W("JitNoInline"), 0)                   // Disables inlining of all methods
 CONFIG_INTEGER(JitNoMemoryBarriers, W("JitNoMemoryBarriers"), 0)   // If 1, don't generate memory barriers
 CONFIG_INTEGER(JitNoStructPromotion, W("JitNoStructPromotion"), 0) // Disables struct promotion 1 - for all, 2 - for
                                                                    // params.
@@ -190,6 +191,9 @@ CONFIG_INTEGER(JitStressProcedureSplitting, W("JitStressProcedureSplitting"), 0)
                                                                                  // block.
 CONFIG_INTEGER(JitStressRegs, W("JitStressRegs"), 0)
 CONFIG_STRING(JitStressRegsRange, W("JitStressRegsRange")) // Only apply JitStressRegs to methods in this hash range
+
+// If non-negative value N, only stress split the first N trees.
+CONFIG_INTEGER(JitStressSplitTreeLimit, W("JitStressSplitTreeLimit"), -1)
 
 // If non-zero, assert if # of VNF_MapSelect applications considered reaches this.
 CONFIG_INTEGER(JitVNMapSelLimit, W("JitVNMapSelLimit"), 0)
@@ -358,10 +362,15 @@ RELEASE_CONFIG_INTEGER(EnableEHWriteThru, W("EnableEHWriteThru"), 1)
 // Enable the enregistration of locals that are defined or used in a multireg context.
 RELEASE_CONFIG_INTEGER(EnableMultiRegLocals, W("EnableMultiRegLocals"), 1)
 
-// Enable EVEX encoding for SIMD instructions when AVX-512VL is available.
-CONFIG_INTEGER(JitStressEvexEncoding, W("JitStressEvexEncoding"), 0)
+// Disables inlining of all methods
+RELEASE_CONFIG_INTEGER(JitNoInline, W("JitNoInline"), 0)
 
 // clang-format off
+
+#if defined(TARGET_AMD64) || defined(TARGET_X86)
+// Enable EVEX encoding for SIMD instructions when AVX-512VL is available.
+CONFIG_INTEGER(JitStressEvexEncoding, W("JitStressEvexEncoding"), 0)
+#endif
 
 RELEASE_CONFIG_INTEGER(PreferredVectorBitWidth,     W("PreferredVectorBitWidth"),   0) // The preferred decimal width, in bits, to use for any implicit vectorization emitted. A value less than 128 is treated as the system default.
 
@@ -417,6 +426,9 @@ RELEASE_CONFIG_INTEGER(EnableArm64Sha1,             W("EnableArm64Sha1"),       
 RELEASE_CONFIG_INTEGER(EnableArm64Sha256,           W("EnableArm64Sha256"),         1) // Allows Arm64 Sha256+ hardware intrinsics to be disabled
 RELEASE_CONFIG_INTEGER(EnableArm64Sve,              W("EnableArm64Sve"),            1) // Allows Arm64 Sve+ hardware intrinsics to be disabled
 #endif
+
+RELEASE_CONFIG_INTEGER(EnableEmbeddedBroadcast,     W("EnableEmbeddedBroadcast"),   1) // Allows embedded broadcasts to be disabled
+RELEASE_CONFIG_INTEGER(EnableEmbeddedMasking,       W("EnableEmbeddedMasking"),     1) // Allows embedded masking to be disabled
 
 // clang-format on
 
@@ -496,19 +508,20 @@ CONFIG_STRING(JitRLCSEAlpha, W("JitRLCSEAlpha"))
 // If nonzero, dump candidate feature values
 CONFIG_INTEGER(JitRLCSECandidateFeatures, W("JitRLCSECandidateFeatures"), 0)
 
+// Enable CSE_HeuristicRLHook
+CONFIG_INTEGER(JitRLHook, W("JitRLHook"), 0) // If 1, emit RL callbacks
+
+// If 1, emit feature column names
+CONFIG_INTEGER(JitRLHookEmitFeatureNames, W("JitRLHookEmitFeatureNames"), 0)
+
+// A list of CSEs to choose, in the order they should be applied.
+CONFIG_STRING(JitRLHookCSEDecisions, W("JitRLHookCSEDecisions"))
+
 #if !defined(DEBUG) && !defined(_DEBUG)
 RELEASE_CONFIG_INTEGER(JitEnableNoWayAssert, W("JitEnableNoWayAssert"), 0)
 #else  // defined(DEBUG) || defined(_DEBUG)
 RELEASE_CONFIG_INTEGER(JitEnableNoWayAssert, W("JitEnableNoWayAssert"), 1)
 #endif // !defined(DEBUG) && !defined(_DEBUG)
-
-// Track GC roots
-#if defined(TARGET_AMD64) || defined(TARGET_X86)
-#define JitMinOptsTrackGCrefs_Default 0 // Not tracking GC refs in MinOpts is new behavior
-#else
-#define JitMinOptsTrackGCrefs_Default 1
-#endif
-RELEASE_CONFIG_INTEGER(JitMinOptsTrackGCrefs, W("JitMinOptsTrackGCrefs"), JitMinOptsTrackGCrefs_Default)
 
 // The following should be wrapped inside "#if MEASURE_MEM_ALLOC / #endif", but
 // some files include this one without bringing in the definitions from "jit.h"
@@ -551,6 +564,7 @@ OPT_CONFIG_STRING(JitOnlyOptimizeRange,
 OPT_CONFIG_STRING(JitEnablePhysicalPromotionRange, W("JitEnablePhysicalPromotionRange"))
 OPT_CONFIG_STRING(JitEnableCrossBlockLocalAssertionPropRange, W("JitEnableCrossBlockLocalAssertionPropRange"))
 OPT_CONFIG_STRING(JitEnableInductionVariableOptsRange, W("JitEnableInductionVariableOptsRange"))
+OPT_CONFIG_STRING(JitEnableLocalAddrPropagationRange, W("JitEnableLocalAddrPropagationRange"))
 
 OPT_CONFIG_INTEGER(JitDoSsa, W("JitDoSsa"), 1) // Perform Static Single Assignment (SSA) numbering on the variables
 OPT_CONFIG_INTEGER(JitDoValueNumber, W("JitDoValueNumber"), 1) // Perform value numbering on method expressions
@@ -634,7 +648,10 @@ RELEASE_CONFIG_INTEGER(JitExtDefaultPolicyProfScale, W("JitExtDefaultPolicyProfS
 RELEASE_CONFIG_INTEGER(JitInlinePolicyModel, W("JitInlinePolicyModel"), 0)
 RELEASE_CONFIG_INTEGER(JitInlinePolicyProfile, W("JitInlinePolicyProfile"), 0)
 RELEASE_CONFIG_INTEGER(JitInlinePolicyProfileThreshold, W("JitInlinePolicyProfileThreshold"), 40)
-RELEASE_CONFIG_INTEGER(JitObjectStackAllocation, W("JitObjectStackAllocation"), 0)
+CONFIG_STRING(JitObjectStackAllocationRange, W("JitObjectStackAllocationRange"))
+RELEASE_CONFIG_INTEGER(JitObjectStackAllocation, W("JitObjectStackAllocation"), 1)
+RELEASE_CONFIG_INTEGER(JitObjectStackAllocationRefClass, W("JitObjectStackAllocationRefClass"), 1)
+RELEASE_CONFIG_INTEGER(JitObjectStackAllocationBoxedValueClass, W("JitObjectStackAllocationBoxedValueClass"), 1)
 
 RELEASE_CONFIG_INTEGER(JitEECallTimingInfo, W("JitEECallTimingInfo"), 0)
 
@@ -667,6 +684,9 @@ RELEASE_CONFIG_INTEGER(TC_OnStackReplacement_InitialCounter, W("TC_OnStackReplac
 
 // Enable partial compilation for Tier0 methods
 RELEASE_CONFIG_INTEGER(TC_PartialCompilation, W("TC_PartialCompilation"), 0)
+
+// If partial compilation is enabled, use random heuristic for patchpoint placement
+CONFIG_INTEGER(JitRandomPartialCompilation, W("JitRandomPartialCompilation"), 0)
 
 // Patchpoint strategy:
 // 0 - backedge sources
@@ -755,7 +775,13 @@ RELEASE_CONFIG_INTEGER(JitEnablePhysicalPromotion, W("JitEnablePhysicalPromotion
 RELEASE_CONFIG_INTEGER(JitEnableCrossBlockLocalAssertionProp, W("JitEnableCrossBlockLocalAssertionProp"), 1)
 
 // Do greedy RPO-based layout in Compiler::fgReorderBlocks.
-RELEASE_CONFIG_INTEGER(JitDoReversePostOrderLayout, W("JitDoReversePostOrderLayout"), 0);
+RELEASE_CONFIG_INTEGER(JitDoReversePostOrderLayout, W("JitDoReversePostOrderLayout"), 1);
+
+// Enable strength reduction
+RELEASE_CONFIG_INTEGER(JitEnableStrengthReduction, W("JitEnableStrengthReduction"), 1)
+
+// Enable IV optimizations
+RELEASE_CONFIG_INTEGER(JitEnableInductionVariableOpts, W("JitEnableInductionVariableOpts"), 1)
 
 // JitFunctionFile: Name of a file that contains a list of functions. If the currently compiled function is in the
 // file, certain other JIT config variables will be active. If the currently compiled function is not in the file,
